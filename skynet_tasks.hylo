@@ -1,0 +1,184 @@
+trait CompletionHandler: Deinitializable {
+
+  public fun set_value(_ value: Int) inout
+  public fun set_error(_ error_code: Int) inout
+  public fun set_done() inout
+
+}
+
+type CompletionHandlerRef: CompletionHandler, Movable {
+
+  // We assume the object has external storage
+  var handler_pointer: MemoryAddress
+  var set_value_function: [](MemoryAddress, Int) -> Void
+  var set_error_function: [](MemoryAddress, Int) -> Void
+  var set_done_function: [](MemoryAddress) -> Void
+
+  public init<C: CompletionHandler>(completion: PointerToMutable<C>) {
+    &self.handler_pointer = .new(type_punning: completion.copy())
+    &self.set_value_function = fun(_ p: MemoryAddress, _ value: Int) -> Void {
+      PointerToMutable<C>(type_punning: p).copy().unsafe[].set_value(value)
+    }
+    &self.set_error_function = fun(_ p: MemoryAddress, _ error_code: Int) -> Void {
+      PointerToMutable<C>(type_punning: p).copy().unsafe[].set_error(error_code)
+    }
+    &self.set_done_function = fun(_ p: MemoryAddress) -> Void {
+      PointerToMutable<C>(type_punning: p).copy().unsafe[].set_done()
+    }
+  }
+
+  public fun set_value(_ value: Int) inout {
+    set_value_function(self.handler_pointer, value)
+  }
+
+  public fun set_error(_ error_code: Int) inout {
+    set_error_function(self.handler_pointer, error_code)
+  }
+
+  public fun set_done() inout {
+    set_done_function(self.handler_pointer)
+  }
+
+}
+
+type SkynetCompletion: CompletionHandler, Movable {
+
+  var parent_completion: PointerToMutable<CompletionHandlerRef>
+  var result: UInt32 // used as atomic
+  var count_done: UInt32
+  var sync_point: UInt32
+
+  public init(parent_completion: PointerToMutable<CompletionHandlerRef>) {
+    &self.parent_completion = parent_completion.copy()
+    &self.result = 0
+    &self.count_done = 0
+    &self.sync_point = 0
+  }
+
+  public fun set_value(_ value: Int) inout {
+    // Write the value to the corresponding index.
+    _ = atomic_add_relaxed_i32(&result, UInt32(truncating_or_extending: value))
+    _ = atomic_swap_release_i32(&sync_point, 1) // release synchronization barrier
+
+    // If all the children are done, we are done, so start the continuation.
+    let r = atomic_add_relaxed_i32(&count_done, 1)
+    if r == 9 {
+      _ = atomic_load_acquire_i32(&sync_point) // acquire synchronization barrier
+      parent_completion.copy().unsafe[].set_value(Int(truncating_or_extending: result))
+    }
+  }
+
+  public fun set_error(_ error_code: Int) inout {
+    precondition(false, "SkynetCompletion does not support set_error")
+  }
+
+  public fun set_done() inout {
+    precondition(false, "SkynetCompletion does not support set_done")
+  }
+
+}
+
+type SkynetTask: Deinitializable {
+
+  var task: TaskBase
+  internal var executor: PointerToMutable<ThreadPoolExecutor>
+  internal var index: Int
+  internal var size: Int
+  internal var children: BoundedArray<SkynetTask>
+  internal var child_completion: SkynetCompletion
+  internal var parent_completion: CompletionHandlerRef
+
+  public init<C: CompletionHandler>(executor: PointerToMutable<ThreadPoolExecutor>, index: Int, size: Int, completion: inout C) {
+    TaskBase.`init`(self: &self.task, executing: fun[] (_ task: TaskPointer) -> Void {
+      PointerToMutable<Self>(type_punning: task).copy().unsafe[].execute()
+    })
+    &self.executor = executor.copy()
+    &self.index = index.copy()
+    &self.size = size.copy()
+    &self.children = .new(capacity: 10)
+    &self.parent_completion = .new(completion: mutable_pointer[to: &completion])
+    &self.child_completion = .new(parent_completion: mutable_pointer[to: &parent_completion].copy())
+  }
+
+  fun execute() inout -> Void {
+    if size < 10 {
+      let result = 0
+      for sink let i in 0 ..< size {
+        &result = index + i
+      }
+      &parent_completion.set_value(result)
+    }
+    else {
+      let sub_size = size / 10
+      for sink let i in 0 ..< 10 {
+        let sub_index = index + i * sub_size
+        let executor = executor.copy()
+        // Create a new subtask.
+        inout completion = &child_completion
+        &children.append(initialized_with: fun (_ sub_task: set SkynetTask) -> Void {
+          SkynetTask.`init`<SkynetCompletion>(self: &sub_task, executor: executor, index: sub_index, size: sub_size, completion: &completion)
+        })
+        // Enqueue the subtask.
+        executor.copy().unsafe[].enqueue(children[i].as_task())
+      }
+    }
+  }
+
+  public fun as_task() inout -> TaskPointer {
+    return mutable_pointer[to: &self.task].copy()
+  }
+
+}
+
+@ffi("clock")
+public fun clock() -> Int
+
+fun time_in_ms(_ clock_diff: Int) -> Int {
+  return clock_diff / 10_000 // TODO: constant dependent on the platform
+}
+
+type FinalCompletion: CompletionHandler {
+
+  internal var result: Int
+  var done: UInt32
+
+  public init() {
+    &self.result = 0
+    &self.done = 0
+  }
+
+  public fun set_value(_ value: Int) inout {
+    &self.result = value.copy()
+    _ = atomic_swap_release_i32(&done, 1) // release synchronization barrier
+  }
+
+  public fun set_error(_ error_code: Int) inout {
+    precondition(false, "FinalCompletion does not support set_error")
+  }
+
+  public fun set_done() inout {
+    precondition(false, "FinalCompletion does not support set_done")
+  }
+
+  public fun is_done() inout -> Bool {
+    return atomic_load_acquire_i32(&done) > 0
+  }
+
+}
+
+public fun main() {
+  var executor = ThreadPoolExecutor(size: available_parallelism())
+  let start = clock()
+  let completion = FinalCompletion()
+  var root_task: SkynetTask
+  SkynetTask.`init`(self: &root_task, executor: mutable_pointer[to: &executor], index: 0, size: 10_000, completion: &completion)
+  &executor.enqueue(root_task.as_task())
+  while completion.is_done() == false {
+    yield_now()
+  }
+  executor.await()
+  let end = clock()
+  print(time_in_ms(end - start), terminator: " ms\n")
+  print(completion.result)
+  precondition(completion.result == 49995000, "invalid result")
+}
